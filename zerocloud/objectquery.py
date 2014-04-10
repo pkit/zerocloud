@@ -1133,6 +1133,11 @@ class ObjectQueryMiddleware(object):
 
                     return self.app(env, validate_resp)
                 else:
+                    self.logger.info(
+                        '%s content-type: %s, x-zerovm-validate: %s'
+                        % (req.url,
+                           req.headers.get('content-type', ''),
+                           str('x-zerovm-validate' in req.headers)))
                     return self.app(env, start_response)
             except (Exception, Timeout):
                 self.logger.exception(_('ERROR __call__ error with %(method)s'
