@@ -1,13 +1,11 @@
-from eventlet import spawn, wsgi, listen
+from eventlet import sleep, spawn, wsgi, listen, GreenPool
 import mock
 from eventlet.green import os
 from tempfile import mkdtemp
 from shutil import rmtree
 from time import time
 import unittest
-
 import swift
-
 try:
     import simplejson as json
 except ImportError:
@@ -19,13 +17,15 @@ from swift.common.http import is_success
 from swift.common.swob import Request
 from swift.container import server as container_server
 from swift.obj import server as object_server
-from swift.common.utils import mkdirs, normalize_timestamp, NullLogger
+from swift.common.utils import mkdirs, normalize_timestamp, NullLogger, public, \
+    timing_stats
 from swift.common import utils
 from swift.common import storage_policy
 from swift.common.storage_policy import StoragePolicy, \
     StoragePolicyCollection, POLICIES
 from test.unit import debug_logger, FakeMemcache, write_fake_ring, FakeRing
 from zerocloud import queue
+from zerocloud import null_server
 
 _test_coros = _test_servers = _test_sockets = _orig_container_listing_limit = \
     _testdir = _orig_SysLogHandler = _orig_POLICIES = _test_POLICIES = None
@@ -37,18 +37,6 @@ class FakeMemcacheReturnsNone(FakeMemcache):
         # Returns None as the timestamp of the container; assumes we're only
         # using the FakeMemcache for container existence checks.
         return None
-
-
-def setup():
-    do_setup(object_server)
-
-
-def teardown():
-    for server in _test_coros:
-        server.kill()
-    rmtree(os.path.dirname(_testdir))
-    utils.SysLogHandler = _orig_SysLogHandler
-    storage_policy._POLICIES = _orig_POLICIES
 
 
 def do_setup(the_object_server):
@@ -167,12 +155,41 @@ def do_setup(the_object_server):
 
 class TestQueue(unittest.TestCase):
 
+    @classmethod
+    def setUpClass(cls):
+        do_setup(object_server)
+
+    @classmethod
+    def tearDownClass(cls):
+        for server in _test_coros:
+            server.kill()
+        rmtree(os.path.dirname(_testdir))
+        utils.SysLogHandler = _orig_SysLogHandler
+        storage_policy._POLICIES = _orig_POLICIES
+
     def setUp(self):
         self.proxy_app = \
             proxy_server.Application(None, FakeMemcache(),
                                      logger=debug_logger('proxy-ut'),
                                      account_ring=FakeRing(),
                                      container_ring=FakeRing())
+        resp = self.create_queue('test')
+        self.assertTrue(is_success(resp.status_int))
+
+    def tearDown(self):
+        self.clear_queue('test')
+        resp = self.delete_queue('test')
+        self.assertTrue(is_success(resp.status_int))
+
+    def _verify_claim(self, claim_data, orig_message, ttl, timestamp):
+        self.assertEqual(claim_data['data'], orig_message['data'])
+        self.assertEqual(claim_data['msg_id'], orig_message['msg_id'])
+        claim_id = claim_data['claim_id']
+        exp_ts = float(claim_id.split('/', 1)[0])
+        self.assertTrue((timestamp + ttl) <= exp_ts < (timestamp + ttl + 1))
+
+    def _build_msg(self, i):
+        return json.dumps({('msg-%d' % i): i})
 
     def create_queue(self, name):
         req = Request.blank('/queue/a/%s' % name,
@@ -189,16 +206,12 @@ class TestQueue(unittest.TestCase):
         return resp
 
     def clear_queue(self, name):
-        prefix = _test_servers[0].queue_prefix
+        prefix = _test_servers[0].client.queue_prefix
         req = Request.blank('/v1/a/%s%s?format=json' % (prefix, name))
         prosrv = _test_servers[0]
         resp = req.get_response(prosrv)
         for item in json.loads(resp.body):
             obj_name = item['name']
-            req = Request.blank('/v1/a/%s%s/%s' % (prefix, name, obj_name),
-                                environ={'REQUEST_METHOD': 'GET'})
-            resp = req.get_response(prosrv)
-            print [resp.status, resp.headers]
             req = Request.blank('/v1/a/%s%s/%s' % (prefix, name, obj_name),
                                 environ={'REQUEST_METHOD': 'DELETE'})
             resp = req.get_response(prosrv)
@@ -223,8 +236,7 @@ class TestQueue(unittest.TestCase):
                       client_id='client-1'):
         req = Request.blank('/queue/a/%s/message' % queue_name,
                             environ={'REQUEST_METHOD': 'GET'},
-                            headers={'Content-Type': 'application/json',
-                                     'Client-Id': client_id})
+                            headers={'Client-Id': client_id})
         if limit:
             req.query_string = 'limit=%d' % limit
         if echo:
@@ -233,9 +245,44 @@ class TestQueue(unittest.TestCase):
         resp = req.get_response(prosrv)
         return resp
 
+    def claim_messages(self, queue_name, echo=False, limit=10,
+                       client_id='client-1', ttl=None):
+        req = Request.blank('/queue/a/%s/claim' % queue_name,
+                            environ={'REQUEST_METHOD': 'POST'},
+                            headers={'Content-Length': 0,
+                                     'Client-Id': client_id})
+        if limit is not None:
+            req.query_string = 'limit=%d' % limit
+        if echo:
+            req.query_string += '&echo=true'
+        if ttl is not None:
+            req.query_string += '&ttl=%d' % ttl
+        prosrv = _test_servers[0]
+        resp = req.get_response(prosrv)
+        return resp
+
+    def update_claim(self, queue_name, claim_id,
+                     client_id='client-1', ttl=None):
+        req = Request.blank('/queue/a/%s/claim/%s' % (queue_name, claim_id),
+                            environ={'REQUEST_METHOD': 'POST'},
+                            headers={'Content-Length': 0,
+                                     'Client-Id': client_id})
+        if ttl is not None:
+            req.query_string = 'ttl=%d' % ttl
+        prosrv = _test_servers[0]
+        resp = req.get_response(prosrv)
+        return resp
+
+    def delete_message(self, queue_name, claim_id, client_id='client-1'):
+        req = Request.blank('/queue/a/%s/message/%s' % (queue_name, claim_id),
+                            environ={'REQUEST_METHOD': 'DELETE'},
+                            headers={'Content-Length': 0,
+                                     'Client-Id': client_id})
+        prosrv = _test_servers[0]
+        resp = req.get_response(prosrv)
+        return resp
+
     def test_create_queue(self):
-        resp = self.create_queue('test')
-        self.assertTrue(is_success(resp.status_int))
         resp = self.create_queue('test')
         self.assertTrue(is_success(resp.status_int))
         resp = self.create_queue('test1')
@@ -249,7 +296,6 @@ class TestQueue(unittest.TestCase):
             calls[0] += 1
             return subreq(*args, **kwargs)
 
-        self.create_queue('test')
         with mock.patch('zerocloud.queue.make_subrequest', mock_subreq):
             req = Request.blank('/queue/a')
             prosrv = _test_servers[0]
@@ -265,7 +311,6 @@ class TestQueue(unittest.TestCase):
         self.assertTrue(is_success(resp.status_int))
 
     def test_put_message(self):
-        self.create_queue('test')
         data = {'aaa': '111', 'bbb': '222'}
         data = json.dumps(data)
         resp = self.put_message('test', data)
@@ -284,7 +329,6 @@ class TestQueue(unittest.TestCase):
         self.assertEqual(resp_data['claim_id'][-len(tail):], tail)
 
     def test_list_all_messages(self):
-        self.create_queue('test')
         data = {'aaa': '111', 'bbb': '222'}
         data = json.dumps(data)
         resp = self.put_message('test', data)
@@ -300,12 +344,8 @@ class TestQueue(unittest.TestCase):
         list_data = json.loads(resp.body)
         self.assertEqual(resp_data[0], list_data[0])
         self.assertEqual(resp_data, list_data)
-        self.clear_queue('test')
-        resp = self.delete_queue('test')
-        self.assertTrue(is_success(resp.status_int))
 
     def test_put_message_ttl(self):
-        self.create_queue('test')
         data = {'aaa': '111', 'bbb': '222'}
         data = json.dumps(data)
         resp = self.put_message('test', data, ttl=1)
@@ -318,4 +358,229 @@ class TestQueue(unittest.TestCase):
         list_data = json.loads(resp.body)
         print list_data
         # something strange here, works well on real Swift
-        self.clear_queue('test')
+
+    def test_no_get_object(self):
+        # tests that we never issue a GET for any object url
+        orig_get = object_server.ObjectController.GET
+        calls = [0]
+
+        @public
+        @timing_stats()
+        def mock_get(*args, **kwargs):
+            calls[0] += 1
+            return orig_get(*args, **kwargs)
+
+        with mock.patch('swift.obj.server.ObjectController.GET', mock_get):
+            data = {'aaa': '111', 'bbb': '222'}
+            data = json.dumps(data)
+            resp = self.put_message('test', data)
+            self.assertTrue(is_success(resp.status_int))
+            resp_data = [json.loads(resp.body)]
+            resp = self.list_messages('test', echo=True)
+            list_data = json.loads(resp.body)
+            self.assertEqual(resp_data[0], list_data[0])
+            resp_data.append(json.loads(self.put_message('test', data).body))
+            resp_data.append(json.loads(self.put_message('test', data).body))
+            resp_data.append(json.loads(self.put_message('test', data).body))
+            resp = self.list_messages('test', echo=True)
+            list_data = json.loads(resp.body)
+            self.assertEqual(resp_data, list_data)
+        self.assertEqual(calls[0], 0)
+
+    def put_messages(self, start, end):
+        resp_list = []
+        for i in range(start, end):
+            data = self._build_msg(i)
+            resp = self.put_message('test', data)
+            resp_data = json.loads(resp.body)
+            self.assertEqual(json.dumps(resp_data['data']), data)
+            self.assertEqual(resp_data['client_id'], 'client-1')
+            tail = '/client-1/client-1'
+            self.assertEqual(resp_data['claim_id'][-len(tail):], tail)
+            resp_list.append(resp_data)
+        return resp_list
+
+    def test_list_messages(self):
+        resp_list = self.put_messages(0, 10)
+        resp = self.list_messages('test', echo=True)
+        list_data = json.loads(resp.body)
+        self.assertEqual(resp_list, list_data)
+        resp = self.list_messages('test')
+        list_data = json.loads(resp.body)
+        self.assertEqual(len(list_data), 0)
+        resp = self.list_messages('test', client_id='client-2')
+        list_data = json.loads(resp.body)
+        self.assertEqual(resp_list, list_data)
+
+    def test_claim_messages(self):
+        resp_list = self.put_messages(0, 10)
+        resp = self.claim_messages('test', limit=1)
+        claim_data = json.loads(resp.body)
+        self.assertEqual(len(claim_data), 0)
+        now = time()
+        ttl = 1
+        resp = self.claim_messages('test', limit=1, client_id='client-2',
+                                   ttl=ttl)
+        claim_data = json.loads(resp.body)
+        self.assertEqual(len(claim_data), 1)
+        exp_ts = float(claim_data[0]['claim_id'].split('/', 1)[0])
+        self.assertTrue((now + ttl) <= exp_ts < (now + ttl + 1))
+        resp = self.list_messages('test', limit=1, client_id='client-2')
+        list_data = json.loads(resp.body)
+        self.assertEqual(resp_list[1], list_data[0])
+        sleep(ttl)
+        resp = self.list_messages('test', limit=10, client_id='client-2')
+        list_data = json.loads(resp.body)
+        self.assertEqual(resp_list[0]['data'], list_data[9]['data'])
+        self.assertEqual(resp_list[0]['msg_id'], list_data[9]['msg_id'])
+        now = time()
+        resp = self.claim_messages('test', limit=2, client_id='client-2',
+                                   ttl=ttl)
+        claim_data = json.loads(resp.body)
+        self.assertEqual(len(claim_data), 2)
+        exp_ts = float(claim_data[0]['claim_id'].split('/', 1)[0])
+        self.assertTrue((now + ttl) <= exp_ts < (now + ttl + 1))
+        exp_ts = float(claim_data[1]['claim_id'].split('/', 1)[0])
+        self.assertTrue((now + ttl) <= exp_ts < (now + ttl + 1))
+        resp = self.list_messages('test', limit=1, client_id='client-2')
+        list_data = json.loads(resp.body)
+        self.assertEqual(resp_list[3], list_data[0])
+
+    def test_claim_update(self):
+        resp_list = self.put_messages(0, 10)
+        now = time()
+        ttl = 1
+        resp = self.claim_messages('test', limit=1, client_id='client-2',
+                                   ttl=ttl)
+        claim_data = json.loads(resp.body)
+        self.assertEqual(len(claim_data), 1)
+        self._verify_claim(claim_data[0], resp_list[0], ttl, now)
+        sleep(ttl/2.0)
+        now = time()
+        claim_id_old = claim_data[0]['claim_id']
+        resp = self.update_claim('test', claim_id_old,
+                                 client_id='client-2', ttl=ttl)
+        claim_data = json.loads(resp.body)
+        self._verify_claim(claim_data, resp_list[0], ttl, now)
+        sleep(ttl)
+        # can update even expired claim if nobody else claimed it yet
+        now = time()
+        claim_id_new = claim_data['claim_id']
+        resp = self.update_claim('test', claim_id_new,
+                                 client_id='client-2', ttl=ttl)
+        claim_data = json.loads(resp.body)
+        self._verify_claim(claim_data, resp_list[0], ttl, now)
+        # cannot update already reclaimed claim
+        resp = self.update_claim('test', claim_id_old,
+                                 client_id='client-2', ttl=ttl)
+        self.assertEqual(resp.status_int, 404)
+        # cannot reclaim existing claim from other client
+        resp = self.update_claim('test', claim_id_new,
+                                 client_id='client-3', ttl=ttl)
+        self.assertEqual(resp.status_int, 412)
+        # cannot update already reclaimed claim even if not expired yet
+        now = time()
+        claim_id_reclaimed = claim_data['claim_id']
+        resp = self.update_claim('test', claim_id_reclaimed,
+                                 client_id='client-2', ttl=ttl)
+        claim_data = json.loads(resp.body)
+        self._verify_claim(claim_data, resp_list[0], ttl, now)
+        resp = self.update_claim('test', claim_id_new,
+                                 client_id='client-2', ttl=ttl)
+        self.assertEqual(resp.status_int, 404)
+
+    def test_claim_and_delete(self):
+        resp_list = self.put_messages(0, 10)
+        resp = self.list_messages('test', client_id='client-2', limit=1)
+        list_data = json.loads(resp.body)
+        self.assertEqual(len(list_data), 1)
+        self.assertEqual(resp_list[0], list_data[0])
+        now = time()
+        ttl = 1
+        resp = self.claim_messages('test', limit=1, client_id='client-2',
+                                   ttl=ttl)
+        claim_data = json.loads(resp.body)
+        self.assertEqual(len(claim_data), 1)
+        self._verify_claim(claim_data[0], resp_list[0], ttl, now)
+        claim_id = claim_data[0]['claim_id']
+        sleep(ttl/2.0)
+        resp = self.delete_message('test', claim_id, client_id='client-2')
+        self.assertEqual(resp.status_int, 204)
+        # check that we cannot see the message anymore
+        resp = self.list_messages('test', client_id='client-2', limit=10)
+        list_data = json.loads(resp.body)
+        self.assertEqual(len(list_data), 9)
+        for i in range(0, 9):
+            self.assertEqual(resp_list[i + 1], list_data[i])
+        sleep(ttl/2.0)
+        # check that we cannot see the message even after ttl expires
+        resp = self.list_messages('test', client_id='client-2', limit=10)
+        list_data = json.loads(resp.body)
+        self.assertEqual(len(list_data), 9)
+        for i in range(0, 9):
+            self.assertEqual(resp_list[i + 1], list_data[i])
+
+    def test_list_and_delete(self):
+        resp_list = self.put_messages(0, 10)
+        resp = self.list_messages('test', client_id='client-2', limit=1)
+        list_data = json.loads(resp.body)
+        self.assertEqual(len(list_data), 1)
+        self.assertEqual(resp_list[0], list_data[0])
+        claim_id = list_data[0]['claim_id']
+        resp = self.delete_message('test', claim_id, client_id='client-2')
+        self.assertEqual(resp.status_int, 204)
+        # check that we cannot see the message anymore
+        resp = self.list_messages('test', client_id='client-2', limit=10)
+        list_data = json.loads(resp.body)
+        self.assertEqual(len(list_data), 9)
+        for i in range(0, 9):
+            self.assertEqual(resp_list[i + 1], list_data[i])
+
+    def test_claim_update_and_delete(self):
+        resp_list = self.put_messages(0, 10)
+        resp = self.list_messages('test', client_id='client-2', limit=1)
+        list_data = json.loads(resp.body)
+        self.assertEqual(len(list_data), 1)
+        self.assertEqual(resp_list[0], list_data[0])
+        now = time()
+        ttl = 1
+        resp = self.claim_messages('test', limit=1, client_id='client-2',
+                                   ttl=ttl)
+        claim_data = json.loads(resp.body)
+        self.assertEqual(len(claim_data), 1)
+        self._verify_claim(claim_data[0], resp_list[0], ttl, now)
+        claim_id = claim_data[0]['claim_id']
+        sleep(ttl/2.0)
+        now = time()
+        resp = self.update_claim('test', claim_id,
+                                 client_id='client-2', ttl=ttl)
+        claim_data = json.loads(resp.body)
+        self._verify_claim(claim_data, resp_list[0], ttl, now)
+        new_claim_id = claim_data['claim_id']
+        # try deleting old claim, will not succeed
+        resp = self.delete_message('test', claim_id, client_id='client-2')
+        self.assertEqual(resp.status_int, 404)
+        # now try deleting the updated one
+        resp = self.delete_message('test', new_claim_id, client_id='client-2')
+        self.assertEqual(resp.status_int, 204)
+        # check that we cannot see the message anymore
+        resp = self.list_messages('test', client_id='client-2', limit=10)
+        list_data = json.loads(resp.body)
+        self.assertEqual(len(list_data), 9)
+        for i in range(0, 9):
+            self.assertEqual(resp_list[i + 1], list_data[i])
+
+
+class TestQueueNullServer(TestQueue):
+
+    @classmethod
+    def setUpClass(cls):
+        do_setup(null_server)
+
+    @classmethod
+    def tearDownClass(cls):
+        for server in _test_coros:
+            server.kill()
+        rmtree(os.path.dirname(_testdir))
+        utils.SysLogHandler = _orig_SysLogHandler
+        storage_policy._POLICIES = _orig_POLICIES

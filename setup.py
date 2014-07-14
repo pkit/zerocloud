@@ -19,6 +19,9 @@ setup(
     install_requires=[],
     scripts=[],
     entry_points={
+        'paste.app_factory': [
+            'null_object=zerocloud.null_server:app_factory'
+        ],
         'paste.filter_factory': [
             'proxy_query=zerocloud.proxyquery:filter_factory',
             'object_query=zerocloud.objectquery:filter_factory',

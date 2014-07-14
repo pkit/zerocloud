@@ -4,7 +4,8 @@ import uuid
 
 from swift.common.exceptions import ListingIterNotFound, ListingIterError
 from swift.common.http import HTTP_NOT_FOUND, is_success
-from swift.common.swob import wsgify, HTTPNotFound, HTTPRequestEntityTooLarge, HTTPException, HTTPServerError, \
+from swift.common.swob import wsgify, HTTPNotFound, \
+    HTTPRequestEntityTooLarge, HTTPException, HTTPServerError, \
     HTTPUnprocessableEntity, HTTPPreconditionFailed, Response, HTTPNoContent, \
     HTTPCreated
 from swift.common.utils import get_logger, split_path, json, \
@@ -35,18 +36,11 @@ def load_server_conf(conf, sections):
                 conf.update(server_conf[sect])
 
 
-class QueueMiddleware(object):
-    def __init__(self, app, conf, logger=None,
-                 object_ring=None, container_ring=None):
+class QueueClient(object):
+
+    def __init__(self, app, conf):
         self.app = app
-        if logger:
-            self.logger = logger
-        else:
-            self.logger = get_logger(conf, log_route='zqueue')
-        # let's load appropriate server config sections here
-        load_server_conf(conf, ['app:proxy-server'])
-        self.network_chunk_size = int(conf.get('network_chunk_size',
-                                               65536))
+        self.network_chunk_size = int(conf.get('network_chunk_size', 65536))
         self.max_message_size = int(conf.get('max_message_size', 65536))
         self.max_message_ttl = int(conf.get('max_message_ttl', 3600))
         self.swift_version = 'v1'
@@ -196,6 +190,9 @@ class QueueMiddleware(object):
         DELETE /queue/<account>/<queue_name>/message/<claim_id>
 
         """
+        msg = self._get_message(account, queue_name, claim_id, req)
+        if not msg:
+            return HTTPNotFound(request=req)
         queue_path = self.queue_path(account, queue_name)
         path = '%s/%s' % (queue_path, claim_id)
         del_req = make_subrequest(req.environ, method='DELETE',
@@ -319,56 +316,45 @@ class QueueMiddleware(object):
             return resp
         return HTTPNoContent(request=req)
 
-    @wsgify
-    def __call__(self, req):
+    def claim_directly(self, account, queue_name, req, claim_id, claim_ttl):
+        # we claim message even before creating it
+        # i.e. we create already claimed message
+        # it saves us time: PUT -> DELETE -> PUT is converted to just PUT
+        orig_id = req.headers.get('client-id')
+        if not orig_id:
+            return HTTPPreconditionFailed(request=req,
+                                          body='Client-Id header missing',
+                                          content_type='text/plain')
+        data = self._read_body(req)
         try:
-            version, account, queue, _rest = split_path(req.path, 1, 4, True)
+            data = json.loads(data)
         except ValueError:
-            return self.app
-        try:
-            if version == QUEUE_ENDPOINT:
-                if not account:
-                    return HTTPPreconditionFailed(request=req)
-                if req.method == 'GET':
-                    if not queue:
-                        return self.list_queues(account, req)
-                    if queue and _rest == 'message':
-                        return self.list_messages(account, queue, req)
-                elif req.method == 'PUT':
-                    if queue and not _rest:
-                        return self.create_queue(account, queue, req)
-                elif req.method == 'POST':
-                    if not queue and not _rest:
-                        return HTTPUnprocessableEntity(request=req)
-                    if queue and _rest == 'message':
-                        return self.put_message(account, queue, req)
-                    if queue and _rest == 'claim':
-                        return self.claim_messages(account, queue, req)
-                    if queue and _rest.startswith('claim/'):
-                        msg_id = _rest[len('claim/'):]
-                        return self.update_claim(account, queue,
-                                                 msg_id, req)
-                elif req.method == 'DELETE':
-                    if account and queue:
-                        if not _rest:
-                            return self.delete_queue(account, queue, req)
-                        if _rest.startswith('message/'):
-                            msg_id = _rest[len('message/'):]
-                            return self.delete_message(account, queue,
-                                                       msg_id, req)
-                        if _rest.startswith('claim/'):
-                            msg_id = _rest[len('claim/'):]
-                            return self.remove_claim(account, queue,
-                                                     msg_id, req)
-                return HTTPUnprocessableEntity(request=req)
-        except HTTPException as error_response:
-            return error_response
-        except ListingIterNotFound:
-            return HTTPNotFound(request=req)
-        except (Exception, Timeout):
-            self.logger.exception('ERROR Unhandled exception in request')
-            return HTTPServerError(request=req)
-        return self.app
+            return HTTPUnprocessableEntity(
+                request=req,
+                body='Could not load message content as JSON',
+                content_type='text/plain')
+        req = self.verify_message_query_params(req)
+        msg_id = uuid.uuid4().hex[:16]
+        now = normalize_timestamp(time())
+        claim_ts = normalize_timestamp(time() + claim_ttl)
+        queue_path = self.queue_path(account, queue_name)
+        msg_path = '%s/%s/%s/%s' % (claim_ts, msg_id, orig_id, claim_id)
+        put_path = '%s/%s' % (queue_path, msg_path)
+        put_req = make_subrequest(req.environ, method='PUT',
+                                  path=put_path, swift_source='queue')
+        put_req.headers['content-type'] = \
+            json.dumps(data)
+        put_req.headers['x-delete-at'] = int(time() + req.params['ttl'])
+        put_req.content_length = 0
+        put_resp = put_req.get_response(self.app)
+        if not is_success(put_resp.status_int):
+            put_resp.body = 'Failed to put message into %s' % queue_name
+            put_resp.content_type = 'text/plain'
+            return put_resp
+        msg_path = '%s/%s/%s/%s' % (now, msg_id, orig_id, orig_id)
+        msg = _create_message(msg_path, msg_id, orig_id, data)
+        return HTTPCreated(request=req, body=json.dumps(msg),
+                           content_type='application/json')
 
     def _read_body(self, req):
         body = ''
@@ -493,6 +479,70 @@ class QueueMiddleware(object):
         req.params['echo'] = \
             req.params.get('echo', 'f').lower() in TRUE_VALUES
         return req
+
+
+class QueueMiddleware(object):
+    def __init__(self, app, conf, logger=None):
+        self.app = app
+        if logger:
+            self.logger = logger
+        else:
+            self.logger = get_logger(conf, log_route='queue')
+        # let's load appropriate server config sections here
+        load_server_conf(conf, ['app:proxy-server'])
+        self.client = QueueClient(app, conf)
+
+    @wsgify
+    def __call__(self, req):
+        try:
+            version, account, queue, _rest = split_path(req.path, 1, 4, True)
+        except ValueError:
+            return self.app
+        try:
+            if version == QUEUE_ENDPOINT:
+                if not account:
+                    return HTTPPreconditionFailed(request=req)
+                if req.method == 'GET':
+                    if not queue:
+                        return self.client.list_queues(account, req)
+                    if queue and _rest == 'message':
+                        return self.client.list_messages(account, queue, req)
+                elif req.method == 'PUT':
+                    if queue and not _rest:
+                        return self.client.create_queue(account, queue, req)
+                elif req.method == 'POST':
+                    if not queue and not _rest:
+                        return HTTPUnprocessableEntity(request=req)
+                    if queue and _rest == 'message':
+                        return self.client.put_message(account, queue, req)
+                    if queue and _rest == 'claim':
+                        return self.client.claim_messages(account, queue, req)
+                    if queue and _rest.startswith('claim/'):
+                        msg_id = _rest[len('claim/'):]
+                        return self.client.update_claim(account, queue,
+                                                        msg_id, req)
+                elif req.method == 'DELETE':
+                    if account and queue:
+                        if not _rest:
+                            return self.client.delete_queue(account, queue,
+                                                            req)
+                        if _rest.startswith('message/'):
+                            msg_id = _rest[len('message/'):]
+                            return self.client.delete_message(account, queue,
+                                                              msg_id, req)
+                        if _rest.startswith('claim/'):
+                            msg_id = _rest[len('claim/'):]
+                            return self.client.remove_claim(account, queue,
+                                                            msg_id, req)
+                return HTTPUnprocessableEntity(request=req)
+        except HTTPException as error_response:
+            return error_response
+        except ListingIterNotFound:
+            return HTTPNotFound(request=req)
+        except (Exception, Timeout):
+            self.logger.exception('ERROR Unhandled exception in request')
+            return HTTPServerError(request=req)
+        return self.app
 
 
 def filter_factory(global_conf, **local_conf):
