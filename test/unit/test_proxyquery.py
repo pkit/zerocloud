@@ -3789,6 +3789,47 @@ class TestProxyQuery(unittest.TestCase):
         self.assertEqual(res.body, 'hello, world')
         self.check_container_integrity(prosrv, '/v1/a/c', {})
 
+    def test_bad_retcode_debug(self):
+        self.setup_QUERY()
+        prolis = _test_sockets[0]
+        nexe = trim(r'''
+            global error_code
+            error_code = 1
+            err.write('Error happened\n')
+            return pickle.dumps(sorted(id))
+            ''')
+        self.create_object(prolis, '/v1/a/c/rc.nexe', nexe)
+        conf = [
+            {
+                'name': 'sort',
+                'exec': {'path': 'swift://a/c/rc.nexe'},
+                'file_list': [
+                    {'device': 'stdout', 'path': 'swift://a/c/o2*'},
+                    {'device': 'stderr', 'path': 'swift://a/c/o3*'}
+                ],
+                'count': 2
+            }
+        ]
+        conf = json.dumps(conf)
+        prosrv = _test_servers[0]
+        req = self.zerovm_request()
+        req.headers['x-zerovm-debug'] = 'true'
+        req.body = conf
+        res = req.get_response(prosrv)
+        self.assertEqual(res.status_int, 200)
+        self.assertEqual(res.headers['x-nexe-error'], 'bad return code')
+        fd, name = mkstemp()
+        for chunk in res.app_iter:
+            os.write(fd, chunk)
+        os.close(fd)
+        self.assertEqual(os.path.getsize(name), res.content_length)
+        tar = tarfile.open(name)
+        members = tar.getmembers()
+        for member in members:
+            data = tar.extractfile(member).read()
+            self.assertIn('Error happened', data)
+        os.unlink(name)
+
     def test_setting_nexe_headers(self):
         self.setup_QUERY()
         prolis = _test_sockets[0]

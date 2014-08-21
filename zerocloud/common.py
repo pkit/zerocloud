@@ -118,6 +118,8 @@ def merge_headers(final, mergeable, new):
             final[key] += ',' + str(mergeable[key])
     for key in new.keys():
         if key not in key_list:
+            if key.lower() == 'content-length':
+                continue
             final[key] = new[key]
 
 

@@ -201,3 +201,14 @@ executables. STDOUT contents will be sent to the user in GET response.
 If you supply the following query string params: `args`,
 `content_type` they will be substituted for executable argument string
 and response Content-Type respectively.
+
+## Special headers
+
+### Debug mode header
+
+Request can use `X-Zerovm-Debug: true` header to enable user debug mode for 
+the request. In that mode all the data from backends will be streamed back 
+to the user in the response. The only data that will be saved to the 
+location specified in job file, is the collocated channel data (you can 
+disable that behavior by removing collocated channels using `"attach": "none"` 
+node property, for each node).
