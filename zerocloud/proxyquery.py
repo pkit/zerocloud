@@ -275,16 +275,28 @@ class CachedBody(object):
 
 class FinalBody(object):
 
-    def __init__(self, app_iter):
-        self.app_iters = [app_iter]
+    def __init__(self, resp):
+        self.responses = [resp]
+        self.app_iters = [resp.app_iter]
 
     def __iter__(self):
-        for app_iter in self.app_iters:
-            for chunk in app_iter:
-                yield chunk
+        try:
+            for app_iter in self.app_iters:
+                for chunk in app_iter:
+                    yield chunk
+        finally:
+            self.close()
 
-    def append(self, app_iter):
-        self.app_iters.append(app_iter)
+    def append(self, resp):
+        self.responses.append(resp)
+        self.app_iters.append(resp.app_iter)
+
+    def close(self):
+        for resp in self.responses:
+            if resp.http_response:
+                resp.http_response.nuke_from_orbit()
+        self.responses = []
+        self.app_iters = []
 
 
 class NameService(object):
@@ -1111,11 +1123,11 @@ class ClusterController(ObjectController):
                 # this is used.
                 if final_body:
                     # this is not the first iteration of the loop
-                    final_body.append(resp.app_iter)
+                    final_body.append(resp)
                     final_response.content_length += resp.content_length
                 else:
                     # this the first iteration of the loop
-                    final_body = FinalBody(resp.app_iter)
+                    final_body = FinalBody(resp)
                     # FIXME: `resp` needs to be closed at some point;
                     # it might not get garbage collected, so we need to nuke
                     # from orbit.
@@ -2152,9 +2164,9 @@ class ClusterController(ObjectController):
     def _process_response(self, conn, request):
         conn.error = None
         chunk_size = self.middleware.network_chunk_size
+        server_response = conn.resp
         if conn.resp:
             # success
-            server_response = conn.resp
             resp = Response(status='%d %s' %
                                    (server_response.status,
                                     server_response.reason),
@@ -2181,6 +2193,7 @@ class ClusterController(ObjectController):
                 resp = HTTPRequestTimeout(
                     body='Timeout: trying to get final status of POST '
                          'to %s' % request.path_info)
+        resp.http_response = server_response
         return self.process_server_response(conn, request, resp)
 
     def _connect_exec_node(self, obj_nodes, part, request,

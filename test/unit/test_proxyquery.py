@@ -378,6 +378,21 @@ class Utils(object):
         else:
             req.remote_user = user
 
+    def create_http_request(self, req):
+        proto = req.environ['SERVER_PROTOCOL']
+        http_req = [' '.join([req.method, req.path, proto])]
+        for hdr in req.headers:
+            http_req.append('%s: %s' % (hdr, req.headers[hdr]))
+        http_req.append('Connection: close')
+        http_req.append('X-Storage-Token: t')
+        header = '\r\n'.join(http_req) + '\r\n\r\n'
+        data = req.environ['wsgi.input'].read()
+        body = data
+        while data:
+            body += data
+            data = req.environ['wsgi.input'].read()
+        return header + body
+
 
 def do_setup(the_object_server):
     utils.HASH_PATH_SUFFIX = 'endcap'
@@ -894,6 +909,37 @@ class TestProxyQuery(unittest.TestCase, Utils):
         self.assertEqual(res.content_type, 'application/x-pickle')
         self.assertEqual(res.body, self.get_sorted_numbers())
         self.check_container_integrity(prosrv, '/v1/a/c', {})
+
+    def test_immediate_stdout_with_socket(self):
+        self.setup_QUERY()
+        prolis = _test_sockets[0]
+        nexe = trim(r'''
+            return 'a' * (1024 * 1024)
+            ''')
+        self.create_object(prolis, '/v1/a/c/big.nexe', nexe)
+        conf = [
+            {
+                'name': 'sort',
+                'exec': {'path': 'swift://a/c/big.nexe'},
+                'file_list': [
+                    {'device': 'stdin', 'path': 'swift://a/c/o'},
+                    {'device': 'stdout'}
+                ]
+            }
+        ]
+        conf = json.dumps(conf)
+        req = self.zerovm_request()
+        req.body = conf
+        http_req = self.create_http_request(req)
+        sock = connect_tcp(prolis.getsockname())
+        fd = sock.makefile()
+        fd.write(http_req)
+        fd.flush()
+        headers = readuntil2crlfs(fd)
+        print headers
+        fd.read(100)
+        fd.close()
+        sock.close()
 
     def test_QUERY_store_meta(self):
         self.setup_QUERY()
